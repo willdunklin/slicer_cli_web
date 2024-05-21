@@ -33,14 +33,17 @@ from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 
 from .config import PluginSettings
-from .models import CLIItem, DockerImageItem, DockerImageNotFoundError
+from .models import CLIItem, DockerImageNotFoundError, DockerImageItem, SingularityImageItem
 from .rest_slicer_cli import genRESTEndPointsForSlicerCLIsForItem
+
+from girder_worker.docker.tasks import use_singularity # TODO: change this to query the GW container
 
 
 class DockerResource(Resource):
     """
     Resource object that handles runtime generation and deletion of rest
     endpoints
+    Modified to have Singularity support. 'Not a complete version for community yet, just customized for use by SarderLab
     """
 
     jobType = 'slicer_cli_web_job'
@@ -64,6 +67,8 @@ class DockerResource(Resource):
 
         self._generateAllItemEndPoints()
 
+        self.ImageItem = SingularityImageItem if use_singularity() else DockerImageItem
+
     @access.public
     @describeRoute(
         Description('List docker images and their CLIs')
@@ -72,7 +77,7 @@ class DockerResource(Resource):
     def getDockerImages(self, params):
         data = {}
         if self.getCurrentUser():
-            for image in DockerImageItem.findAllImages(self.getCurrentUser()):
+            for image in self.ImageItem.findAllImages(self.getCurrentUser()):
                 imgData = {}
                 for cli in image.getCLIs():
                     basePath = '/%s/cli/%s' % (self.resourceName, cli._id)
@@ -119,7 +124,7 @@ class DockerResource(Resource):
             docker rmi -f <image> )
         :type name: boolean
         """
-        removed = DockerImageItem.removeImages(names, self.getCurrentUser())
+        removed = self.ImageItem.removeImages(names, self.getCurrentUser())
         if removed != names:
             rest = [name for name in names if name not in removed]
             raise RestException('Some docker images could not be removed. %s' % (rest))

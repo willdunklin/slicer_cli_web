@@ -15,6 +15,7 @@
 ###############################################################################
 
 from girder_worker import GirderWorkerPluginABC
+# from girder_worker.docker.tasks import use_singularity # TODO: change this to query the GW container
 
 
 class SlicerCLIWebWorkerPlugin(GirderWorkerPluginABC):
@@ -22,4 +23,9 @@ class SlicerCLIWebWorkerPlugin(GirderWorkerPluginABC):
         self.app = app
 
     def task_imports(self):
-        return ['slicer_cli_web.girder_worker_plugin.direct_docker_run']
+        # if use_singularity():
+        #     return ['slicer_cli_web.girder_worker_plugin.direct_singularity_run']
+        # else:
+        #     return ['slicer_cli_web.girder_worker_plugin.direct_docker_run']
+        return ['slicer_cli_web.girder_worker_plugin.direct_singularity_run',
+                'slicer_cli_web.girder_worker_plugin.direct_docker_run']

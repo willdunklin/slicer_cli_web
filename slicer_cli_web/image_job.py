@@ -17,6 +17,7 @@
 ###############################################################################
 
 import json
+import os
 
 import docker
 from girder import logger
@@ -26,45 +27,62 @@ from girder.models.user import User
 from girder_jobs.constants import JobStatus
 from girder_jobs.models.job import Job
 
-from .models import DockerImageError, DockerImageItem, DockerImageNotFoundError
+from girder_worker.docker.tasks import use_singularity
+
+from .models import DockerImageError, DockerImageItem, DockerImageNotFoundError, SingularityImageItem
+from .models.singularity_image import SingularityImage, SingularityImageItem
+from .singularity.job import (find_and_remove_local_sif_files, is_singularity_installed,
+                              load_meta_data_for_singularity, pull_image_and_convert_to_sif)
+from .singularity.utils import generate_image_name_for_singularity, switch_to_sif_image_folder
 
 
 def deleteImage(job):
     """
-    Deletes the docker images specified in the job from the local machine.
-    Images are forcefully removed (equivalent to docker rmi -f)
-    :param job: The job object specifying the docker images to remove from
+    Deletes the singularity images specified in the job from the local machine.
+    :param job: The job object specifying the singularity images to remove from
     the local machine
 
     """
+    singularity = use_singularity()
+
     job = Job().updateJob(
         job,
-        log='Started to Delete Docker images\n',
+        log=f'Started to Delete {"Singularity" if singularity else "Docker"} images\n',
         status=JobStatus.RUNNING,
     )
+
     docker_client = None
+
     try:
         deleteList = job['kwargs']['deleteList']
         error = False
 
-        try:
-            docker_client = docker.from_env(version='auto')
+        if singularity:
+            sif_folder = os.getenv("SIF_IMAGE_PATH")
+        else:
+            try:
+                docker_client = docker.from_env(version='auto')
 
-        except docker.errors.DockerException as err:
-            logger.exception('Could not create the docker client')
-            job = Job().updateJob(
-                job,
-                log='Failed to create the Docker Client\n' + str(err) + '\n',
-                status=JobStatus.ERROR,
-            )
-            raise DockerImageError('Could not create the docker client')
+            except docker.errors.DockerException as err:
+                logger.exception('Could not create the docker client')
+                job = Job().updateJob(
+                    job,
+                    log='Failed to create the Docker Client\n' + str(err) + '\n',
+                    status=JobStatus.ERROR,
+                )
+                raise DockerImageError('Could not create the docker client')
 
         for name in deleteList:
             try:
-                docker_client.images.remove(name, force=True)
+                if singularity:
+                    name = generate_image_name_for_singularity(name)
+                    filename = os.path.join(sif_folder, name)
+                    os.remove(filename)
+                else:
+                    docker_client.images.remove(name, force=True)
 
             except Exception as err:
-                logger.exception('Failed to remove image')
+                logger.exception('Failed to remove image ', name)
                 job = Job().updateJob(
                     job,
                     log='Failed to remove image \n' + str(err) + '\n',
@@ -126,40 +144,66 @@ def jobPullAndLoad(job):
     """
     stage = 'initializing'
     try:
+        singularity = use_singularity()
         job = Job().updateJob(
             job,
-            log='Started to Load Docker images\n',
+            log=f'Started to Load {"Singularity" if singularity else "Docker"} images\n',
             status=JobStatus.RUNNING,
         )
         user = User().load(job['userId'], level=AccessType.READ)
         baseFolder = Folder().load(
             job['kwargs']['folder'], user=user, level=AccessType.WRITE, exc=True)
-
+        logger.info(f"names = {job['kwargs']['nameList']}")
         loadList = job['kwargs']['nameList']
+        logger.info(f"loadList = {loadList}")
+        job = Job().updateJob(
+            job,
+            log=f'loadList = {loadList}\n',
+        )
 
         errorState = False
 
         notExistSet = set()
-        try:
-            docker_client = docker.from_env(version='auto')
+        if singularity:
+            is_singularity_installed()
 
-        except docker.errors.DockerException as err:
-            logger.exception('Could not create the docker client')
-            job = Job().updateJob(
-                job,
-                log='Failed to create the Docker Client\n' + str(err) + '\n',
-            )
-            raise DockerImageError('Could not create the docker client')
+            # Singularity doesn't use layers and uses caching so if we have a new version of the image with the same tag, it will not be pulled
+            # but instead the same is used from singularity cache. Therefore, we need to remove local images if new version with
+            # same tag has to be pulled.
+            # MAKE SURE YOU'RE' NOT CONSTANTLY PULLING THE SAME VERSION OF THE IMAGE
+            # UNTIL THE ACTUAL IMAGE IS UPDATED
+            for name in loadList:
+                find_and_remove_local_sif_files(name)
 
-        pullList = [
-            name for name in loadList
-            if not findLocalImage(docker_client, name) or
-            str(job['kwargs'].get('pull')).lower() == 'true']
-        loadList = [name for name in loadList if name not in pullList]
+            pullList = loadList
+            loadList = []
+
+        else:
+            try:
+                docker_client = docker.from_env(version='auto')
+
+            except docker.errors.DockerException as err:
+                logger.exception('Could not create the docker client')
+                job = Job().updateJob(
+                    job,
+                    log='Failed to create the Docker Client\n' + str(err) + '\n',
+                )
+                raise DockerImageError('Could not create the docker client')
+
+            pullList = [
+                name for name in loadList
+                if not findLocalImage(docker_client, name) or
+                str(job['kwargs'].get('pull')).lower() == 'true']
+            loadList = [name for name in loadList if name not in pullList]
+
 
         try:
             stage = 'pulling'
-            pullDockerImage(docker_client, pullList)
+            if singularity:
+                switch_to_sif_image_folder()
+                pull_image_and_convert_to_sif(pullList)
+            else:
+                pullDockerImage(docker_client, pullList)
         except DockerImageNotFoundError as err:
             errorState = True
             notExistSet = set(err.imageName)
@@ -169,12 +213,23 @@ def jobPullAndLoad(job):
                     notExistSet) + '\n',
             )
         stage = 'metadata'
-        images, loadingError = loadMetadata(job, docker_client, pullList,
-                                            loadList, notExistSet)
-        for name, cli_dict in images:
-            docker_image = docker_client.images.get(name)
-            stage = 'parsing'
-            DockerImageItem.saveImage(name, cli_dict, docker_image, user, baseFolder)
+
+        if singularity:
+            images, loadingError = load_meta_data_for_singularity(job, pullList,
+                                                                loadList, notExistSet)
+            for name, cli_dict in images:
+                singularity_image_object = SingularityImage(name)
+                stage = 'parsing'
+                SingularityImageItem.saveImage(
+                    name, cli_dict, singularity_image_object, user, baseFolder)
+        else:
+            images, loadingError = loadMetadata(job, docker_client, pullList,
+                                                loadList, notExistSet)
+            for name, cli_dict in images:
+                docker_image = docker_client.images.get(name)
+                stage = 'parsing'
+                DockerImageItem.saveImage(name, cli_dict, docker_image, user, baseFolder)
+
         if errorState is False and loadingError is False:
             newStatus = JobStatus.SUCCESS
         else:
@@ -221,7 +276,6 @@ def loadMetadata(job, docker_client, pullList, loadList, notExistSet):
             job = Job().updateJob(
                 job,
                 log='Image %s was pulled successfully \n' % name,
-
             )
 
             try:

@@ -24,6 +24,8 @@ from .cli_utils import (as_model, generate_description, get_cli_parameters, is_o
 from .models import CLIItem
 from .prepare_task import FOLDER_SUFFIX, OPENAPI_DIRECT_TYPES, prepare_task
 
+from girder_worker.docker.tasks import use_singularity # TODO: change this to query the GW container
+
 _return_parameter_file_desc = """
 Filename in which to write simple return parameters (integer, float,
 integer-vector, etc.) as opposed to bulk return parameters (image, file,
@@ -383,7 +385,10 @@ def genHandlerToRunDockerCLI(cliItem):  # noqa C901
         :param datalist: if not None, an object with keys that override
             parameters.  No outputs are used.
         """
-        from .girder_worker_plugin.direct_docker_run import run
+        if use_singularity():
+            from .girder_worker_plugin.direct_singularity_run import run
+        else:
+            from .girder_worker_plugin.direct_docker_run import run
 
         original_params = copy.deepcopy(params)
         if hasattr(getCurrentToken, 'set'):
@@ -448,7 +453,7 @@ def genHandlerToRunDockerCLI(cliItem):  # noqa C901
             girder_job_type=jobType,
             girder_job_title=jobTitle,
             girder_result_hooks=result_hooks,
-            image=cliItem.digest,
+            image=cliItem.image,
             pull_image='if-not-present',
             container_args=container_args,
             **job_kwargs
